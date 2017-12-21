@@ -41,7 +41,7 @@ def traj_segment_generator(pi, env, horizon, stochastic):
             yield {"ob" : obs, "rew" : rews, "vpred" : vpreds, "new" : news,
                     "ac" : acs, "prevac" : prevacs, "nextvpred": vpred * (1 - new),
                     "ep_rets" : ep_rets, "ep_lens" : ep_lens}
-            _, vpred = pi.act(stochastic, ob)            
+            _, vpred = pi.act(stochastic, ob)
             # Be careful!!! if you change the downstream algorithm to aggregate
             # several of these batches, then be sure to do a deepcopy
             ep_rets = []
@@ -54,6 +54,7 @@ def traj_segment_generator(pi, env, horizon, stochastic):
         prevacs[i] = prevac
 
         ob, rew, new, _ = env.step(ac)
+        new = int(new==2)
         rews[i] = rew
 
         cur_ep_ret += rew
@@ -79,7 +80,39 @@ def add_vtarg_and_adv(seg, gamma, lam):
         gaelam[t] = lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
     seg["tdlamret"] = seg["adv"] + seg["vpred"]
 
-def learn(env, policy_func, *,
+def play(sess, env, policy_func, timesteps_per_batch, load_file):
+    ob_space = env.observation_space
+    ac_space = env.action_space
+    pi = policy_func("pi", ob_space, ac_space)
+
+    saver = tf.train.Saver()
+    if load_file != '':
+        print("Loading policy files {}".format(load_file))
+        saver.restore(sess, load_file)
+
+    else:
+        raise RuntimeError("policy is not specified")
+
+    # Initialize state variables
+    stochastic = False
+    env.set_test(test=True)
+    ob = env.reset()
+
+    cur_ep_ret = 0
+    cur_ep_len = 0
+
+    while True:
+        ac, _ = pi.act(stochastic, ob)
+        ob, r, t, _ = env.step(ac)
+        cur_ep_ret += r
+        cur_ep_len += 1
+        if t or cur_ep_len > timesteps_per_batch:
+            break
+    print("Episode return {} and length {}, terminal {}".format(
+            cur_ep_ret, cur_ep_len, t))
+
+
+def learn(sess, env, policy_func, *,
         timesteps_per_batch, # what to train on
         max_kl, cg_iters,
         gamma, lam, # advantage estimation
@@ -88,11 +121,15 @@ def learn(env, policy_func, *,
         vf_stepsize=3e-4,
         vf_iters =3,
         max_timesteps=0, max_episodes=0, max_iters=0,  # time constraint
-        callback=None
+        callback=None,
+        evaluation,
+        output,
+        load_file,
+        save
         ):
     nworkers = MPI.COMM_WORLD.Get_size()
     rank = MPI.COMM_WORLD.Get_rank()
-    np.set_printoptions(precision=3)    
+    np.set_printoptions(precision=3)
     # Setup losses and stuff
     # ----------------------------------------
     ob_space = env.observation_space
@@ -157,7 +194,7 @@ def learn(env, policy_func, *,
             print(colorize("done in %.3f seconds"%(time.time() - tstart), color='magenta'))
         else:
             yield
-    
+
     def allmean(x):
         assert isinstance(x, np.ndarray)
         out = np.empty_like(x)
@@ -185,7 +222,12 @@ def learn(env, policy_func, *,
 
     assert sum([max_iters>0, max_timesteps>0, max_episodes>0])==1
 
-    while True:        
+    if rank == 0:
+        saver = tf.train.Saver()
+    else:
+        saver = None
+
+    while True:
         if callback: callback(locals(), globals())
         if max_timesteps and timesteps_so_far >= max_timesteps:
             break
@@ -260,7 +302,7 @@ def learn(env, policy_func, *,
         with timed("vf"):
 
             for _ in range(vf_iters):
-                for (mbob, mbret) in dataset.iterbatches((seg["ob"], seg["tdlamret"]), 
+                for (mbob, mbret) in dataset.iterbatches((seg["ob"], seg["tdlamret"]),
                 include_final_partial_batch=False, batch_size=64):
                     g = allmean(compute_vflossandgrad(mbob, mbret))
                     vfadam.update(g, vf_stepsize)
@@ -286,6 +328,10 @@ def learn(env, policy_func, *,
 
         if rank==0:
             logger.dump_tabular()
+
+    # Saving policy and value function
+    if save and saver and output != '':
+        saver.save(sess, './%s' % output)
 
 def flatten_lists(listoflists):
     return [el for list_ in listoflists for el in list_]

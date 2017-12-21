@@ -49,6 +49,7 @@ def traj_segment_generator(pi, env, horizon, stochastic):
         prevacs[i] = prevac
 
         ob, rew, new, _ = env.step(ac)
+        new = int(new==2)
         rews[i] = rew
 
         cur_ep_ret += rew
@@ -77,7 +78,38 @@ def add_vtarg_and_adv(seg, gamma, lam):
         gaelam[t] = lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
     seg["tdlamret"] = seg["adv"] + seg["vpred"]
 
-def learn(env, policy_func, *,
+def play(sess, env, policy_func, timesteps_per_actorbatch, load_file):
+    ob_space = env.observation_space
+    ac_space = env.action_space
+    pi = policy_func("pi", ob_space, ac_space)
+
+    saver = tf.train.Saver()
+    if load_file != '':
+        print("Loading policy files {}".format(load_file))
+        saver.restore(sess, load_file)
+
+    else:
+        raise RuntimeError("policy is not specified")
+
+    # Initialize state variables
+    stochastic = False
+    env.set_test(test=True)
+    ob = env.reset()
+
+    cur_ep_ret = 0
+    cur_ep_len = 0
+
+    while True:
+        ac, _ = pi.act(stochastic, ob)
+        ob, r, t, _ = env.step(ac)
+        cur_ep_ret += r
+        cur_ep_len += 1
+        if t or cur_ep_len > timesteps_per_actorbatch:
+            break
+    print("Episode return {} and length {}, terminal {}".format(
+            cur_ep_ret, cur_ep_len, t))
+
+def learn(sess, env, policy_func, *,
         timesteps_per_actorbatch, # timesteps per actor per update
         clip_param, entcoeff, # clipping parameter epsilon, entropy coeff
         optim_epochs, optim_stepsize, optim_batchsize,# optimization hypers
@@ -85,7 +117,11 @@ def learn(env, policy_func, *,
         max_timesteps=0, max_episodes=0, max_iters=0, max_seconds=0,  # time constraint
         callback=None, # you can do anything in the callback, since it takes locals(), globals()
         adam_epsilon=1e-5,
-        schedule='constant' # annealing for stepsize parameters (epsilon and adam)
+        schedule='constant', # annealing for stepsize parameters (epsilon and adam)
+        evaluation,
+        output,
+        load_file,
+        save
         ):
     # Setup losses and stuff
     # ----------------------------------------
@@ -127,6 +163,8 @@ def learn(env, policy_func, *,
 
     U.initialize()
     adam.sync()
+
+    saver = tf.train.Saver()
 
     # Prepare for rollouts
     # ----------------------------------------
@@ -181,7 +219,7 @@ def learn(env, policy_func, *,
             losses = [] # list of tuples, each of which gives the loss for a minibatch
             for batch in d.iterate_once(optim_batchsize):
                 *newlosses, g = lossandgrad(batch["ob"], batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
-                adam.update(g, optim_stepsize * cur_lrmult) 
+                adam.update(g, optim_stepsize * cur_lrmult)
                 losses.append(newlosses)
             logger.log(fmt_row(13, np.mean(losses, axis=0)))
 
@@ -189,7 +227,7 @@ def learn(env, policy_func, *,
         losses = []
         for batch in d.iterate_once(optim_batchsize):
             newlosses = compute_losses(batch["ob"], batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
-            losses.append(newlosses)            
+            losses.append(newlosses)
         meanlosses,_,_ = mpi_moments(losses, axis=0)
         logger.log(fmt_row(13, meanlosses))
         for (lossval, name) in zipsame(meanlosses, loss_names):
@@ -211,6 +249,10 @@ def learn(env, policy_func, *,
         logger.record_tabular("TimeElapsed", time.time() - tstart)
         if MPI.COMM_WORLD.Get_rank()==0:
             logger.dump_tabular()
+
+    # Saving policy and value function
+    if save and saver and output != '':
+        saver.save(sess, './%s' % output)
 
 def flatten_lists(listoflists):
     return [el for list_ in listoflists for el in list_]
